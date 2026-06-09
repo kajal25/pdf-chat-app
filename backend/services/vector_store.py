@@ -1,131 +1,130 @@
-# This file manages ChromaDB — our vector database
-# It stores text chunks as embeddings and searches for similar ones
+# vector_store.py — Rewritten to use LangChain's Chroma wrapper
+#
+# WHY THE CHANGE:
+# ChromaDB's built-in OpenAIEmbeddingFunction passes a "proxies" argument
+# to openai.OpenAI(), but newer versions of openai removed that argument.
+# → Fix: use LangChain's OpenAIEmbeddings + LangChain's Chroma wrapper instead.
+# LangChain handles embeddings separately, completely avoiding the conflict.
 
-import chromadb
-from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+from langchain_community.vectorstores import Chroma
+from langchain_openai import OpenAIEmbeddings
+from langchain.schema import Document
 from typing import List
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  # Load variables from the .env file
+load_dotenv()
 
-# Create a ChromaDB client that saves data to disk
-# "PersistentClient" means data survives even after you restart the server
-chroma_client = chromadb.PersistentClient(path="./chroma_db")
-
-# Set up OpenAI's embedding function
-# This function converts text → numbers (embeddings)
-openai_embedding_fn = OpenAIEmbeddingFunction(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    model_name="text-embedding-ada-002"  # OpenAI's best embedding model
+# LangChain's OpenAIEmbeddings — works fine with openai 1.16.2
+embeddings_model = OpenAIEmbeddings(
+    openai_api_key=os.getenv("OPENAI_API_KEY"),
+    model="text-embedding-ada-002"
 )
 
-
-def get_collection():
-    """
-    Gets or creates our ChromaDB collection.
-    A "collection" is like a table in a regular database.
-    We use one collection for all PDF chunks.
-    """
-    return chroma_client.get_or_create_collection(
-        name="pdf_documents",
-        embedding_function=openai_embedding_fn,
-        metadata={"hnsw:space": "cosine"}  
-        # Use cosine similarity for searching
-    )
+# LangChain's Chroma wrapper
+# persist_directory = where ChromaDB saves its data on disk
+vectorstore = Chroma(
+    collection_name="pdf_documents",
+    embedding_function=embeddings_model,
+    persist_directory="./chroma_db"
+)
 
 
 def add_documents(chunks: List[dict]) -> int:
     """
-    Adds text chunks to ChromaDB.
-    ChromaDB automatically converts text → embeddings using OpenAI.
-    
-    Returns the number of chunks added.
+    Stores text chunks in ChromaDB via LangChain.
+    LangChain's Chroma wrapper handles the embedding automatically.
     """
-    collection = get_collection()
-    
-    texts = []      # The actual text content
-    metadatas = []  # Source info (filename, page number)
-    ids = []        # Unique ID for each chunk (ChromaDB requires this)
-    
+
+    if not chunks:
+        return 0
+
+    # Convert our chunk dicts into LangChain Document objects
+    # LangChain uses Document(page_content=..., metadata=...) format
+    documents = []
+    ids = []
+
     for i, chunk in enumerate(chunks):
-        texts.append(chunk["text"])
-        metadatas.append(chunk["metadata"])
-        
-        # Create a unique ID using filename + page + chunk index
-        # Replace spaces/dots with underscores for safety
-        safe_name = chunk["metadata"]["source"].replace(
-            ".", "_"
-            ).replace(" ", "_")
-        ids.append(f"{safe_name}_page{chunk['metadata']['page']}_chunk{i}")
-    
-    # Check if these IDs already exist (to avoid duplicates when re-uploading)
-    existing = collection.get(ids=ids)
-    existing_ids = set(existing["ids"])
-    
-    # Filter out chunks that already exist
-    new_texts, new_metadatas, new_ids = [], [], []
-    for text, metadata, doc_id in zip(texts, metadatas, ids):
-        if doc_id not in existing_ids:
-            new_texts.append(text)
-            new_metadatas.append(metadata)
-            new_ids.append(doc_id)
-    
-    if new_texts:
-        # This single call sends all texts to OpenAI for embedding
-        # then stores the embeddings in ChromaDB
-        collection.add(
-            documents=new_texts,
-            metadatas=new_metadatas,
-            ids=new_ids
+        documents.append(
+            Document(
+                page_content=chunk["text"],
+                metadata={
+                    "source": chunk["metadata"]["source"],
+                    "page": chunk["metadata"]["page"]
+                }
+            )
         )
-        print(f"✅ Added {len(new_texts)} new chunks to ChromaDB")
-    else:
-        print("ℹ️  All chunks already exist in the database")
-    
-    return len(new_texts)
+
+        # Unique ID for each chunk
+        safe_name = chunk["metadata"]["source"].replace(".", "_").replace(
+            " ", "_"
+            )
+        ids.append(f"{safe_name}_p{chunk['metadata']['page']}_c{i}")
+
+    # Check for existing IDs to avoid duplicates
+    existing = vectorstore.get(ids=ids)
+    existing_ids = set(existing["ids"])
+
+    # Filter to only new documents
+    new_docs = []
+    new_ids = []
+    for doc, doc_id in zip(documents, ids):
+        if doc_id not in existing_ids:
+            new_docs.append(doc)
+            new_ids.append(doc_id)
+
+    if not new_docs:
+        print("ℹ️  All chunks already in the database — skipping")
+        return 0
+
+    # This sends texts to OpenAI for embedding, then stores in ChromaDB
+    vectorstore.add_documents(documents=new_docs, ids=new_ids)
+
+    print(f"✅ Stored {len(new_docs)} new chunks in ChromaDB")
+    return len(new_docs)
 
 
 def search_similar(query: str, n_results: int = 5) -> dict:
     """
-    Finds the most relevant chunks for a given question.
-    
-    ChromaDB converts the query to an embedding, then finds the
-    stored embeddings that are most similar (closest in vector space).
-    
-    Returns up to n_results chunks.
+    Finds the most relevant chunks for a query using similarity search.
+    Returns results in the same format as before so rag.py 
+    doesn't need changes.
     """
-    collection = get_collection()
-    
-    # Check if collection has any documents
-    count = collection.count()
+
+    # Check if the collection has anything in it
+    count = vectorstore._collection.count()
     if count == 0:
-        return {"documents": [[]], "metadatas": [[]], "distances": [[]]}
-    
-    # Don't request more results than we have
+        return {"documents": [[]], "metadatas": [[]]}
+
+    # Don't ask for more results than we have stored
     actual_results = min(n_results, count)
-    
-    results = collection.query(
-        query_texts=[query],    # ChromaDB will embed this automatically
-        n_results=actual_results
-    )
-    
-    return results
+
+    # LangChain similarity search — returns list of Document objects
+    results = vectorstore.similarity_search(query, k=actual_results)
+
+    # Convert back to the same dict format that rag.py expects
+    documents = [doc.page_content for doc in results]
+    metadatas = [doc.metadata for doc in results]
+
+    return {
+        "documents": [documents],
+        "metadatas": [metadatas]
+    }
 
 
 def list_documents() -> List[str]:
-    """Returns a list of all unique PDF filenames in the database."""
-    collection = get_collection()
-    
-    if collection.count() == 0:
+    """Returns all unique PDF filenames stored in the database."""
+
+    count = vectorstore._collection.count()
+    if count == 0:
         return []
-    
-    # Get all stored metadata
-    all_items = collection.get()
-    
-    # Extract unique filenames
+
+    # Get all stored items and extract unique source filenames
+    all_items = vectorstore.get()
+
     filenames = set()
     for metadata in all_items["metadatas"]:
-        filenames.add(metadata["source"])
-    
+        if metadata and "source" in metadata:
+            filenames.add(metadata["source"])
+
     return sorted(list(filenames))
