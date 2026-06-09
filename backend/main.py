@@ -16,7 +16,7 @@ load_dotenv()
 
 # Create the FastAPI application
 app = FastAPI(
-    title="PDF Chat API",
+    title="Dive in PDF API",
     description="Upload PDFs and chat with them using AI",
     version="1.0.0"
 )
