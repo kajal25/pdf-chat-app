@@ -2,7 +2,7 @@
 # pypdf is pure Python — no compilation, works on any Python version
 
 from pypdf import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from typing import List
 
 
