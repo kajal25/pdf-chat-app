@@ -1,10 +1,8 @@
-# vector_store.py — Rewritten to use LangChain's Chroma wrapper
+# vector_store.py — Fixed with lazy initialization + httpx pinned
 #
-# WHY THE CHANGE:
-# ChromaDB's built-in OpenAIEmbeddingFunction passes a "proxies" argument
-# to openai.OpenAI(), but newer versions of openai removed that argument.
-# → Fix: use LangChain's OpenAIEmbeddings + LangChain's Chroma wrapper instead.
-# LangChain handles embeddings separately, completely avoiding the conflict.
+# KEY CHANGE: Nothing is initialized at module load time.
+# _get_embeddings() and _get_vectorstore() only run when first CALLED.
+# This prevents startup crashes from version conflicts.
 
 from langchain_community.vectorstores import Chroma
 from langchain_openai import OpenAIEmbeddings
@@ -15,32 +13,55 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# LangChain's OpenAIEmbeddings — works fine with openai 1.16.2
-embeddings_model = OpenAIEmbeddings(
-    openai_api_key=os.getenv("OPENAI_API_KEY"),
-    model="text-embedding-ada-002"
-)
+# These start as None — they get created on first use
+_embeddings_model = None
+_vectorstore = None
 
-# LangChain's Chroma wrapper
-# persist_directory = where ChromaDB saves its data on disk
-vectorstore = Chroma(
-    collection_name="pdf_documents",
-    embedding_function=embeddings_model,
-    persist_directory="./chroma_db"
-)
+
+def _get_embeddings():
+    """
+    Returns the embeddings model, creating it on first call.
+    This is called 'lazy initialization' — we wait until it's
+    actually needed before creating it.
+    """
+    global _embeddings_model
+
+    if _embeddings_model is None:
+        print("🔧 Initializing OpenAI embeddings model...")
+        _embeddings_model = OpenAIEmbeddings(
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            model="text-embedding-ada-002"
+        )
+
+    return _embeddings_model
+
+
+def _get_vectorstore():
+    """
+    Returns the ChromaDB vectorstore, creating it on first call.
+    """
+    global _vectorstore
+
+    if _vectorstore is None:
+        print("🔧 Initializing ChromaDB vectorstore...")
+        _vectorstore = Chroma(
+            collection_name="pdf_documents",
+            embedding_function=_get_embeddings(),
+            persist_directory="./chroma_db"
+        )
+
+    return _vectorstore
 
 
 def add_documents(chunks: List[dict]) -> int:
-    """
-    Stores text chunks in ChromaDB via LangChain.
-    LangChain's Chroma wrapper handles the embedding automatically.
-    """
+    """Stores text chunks in ChromaDB."""
 
     if not chunks:
         return 0
 
-    # Convert our chunk dicts into LangChain Document objects
-    # LangChain uses Document(page_content=..., metadata=...) format
+    vs = _get_vectorstore()
+
+    # Build LangChain Document objects
     documents = []
     ids = []
 
@@ -54,77 +75,55 @@ def add_documents(chunks: List[dict]) -> int:
                 }
             )
         )
-
-        # Unique ID for each chunk
-        safe_name = chunk["metadata"]["source"].replace(".", "_").replace(
-            " ", "_"
-            )
+        safe_name = (
+            chunk["metadata"]["source"]
+            .replace(".", "_")
+            .replace(" ", "_")
+        )
         ids.append(f"{safe_name}_p{chunk['metadata']['page']}_c{i}")
 
-    # Check for existing IDs to avoid duplicates
-    existing = vectorstore.get(ids=ids)
+    # Skip duplicates
+    existing = vs.get(ids=ids)
     existing_ids = set(existing["ids"])
 
-    # Filter to only new documents
-    new_docs = []
-    new_ids = []
-    for doc, doc_id in zip(documents, ids):
-        if doc_id not in existing_ids:
-            new_docs.append(doc)
-            new_ids.append(doc_id)
+    new_docs = [d for d, i in zip(documents, ids) if i not in existing_ids]
+    new_ids = [i for i in ids if i not in existing_ids]
 
     if not new_docs:
-        print("ℹ️  All chunks already in the database — skipping")
+        print("ℹ️  All chunks already stored — skipping")
         return 0
 
-    # This sends texts to OpenAI for embedding, then stores in ChromaDB
-    vectorstore.add_documents(documents=new_docs, ids=new_ids)
-
-    print(f"✅ Stored {len(new_docs)} new chunks in ChromaDB")
+    vs.add_documents(documents=new_docs, ids=new_ids)
+    print(f"✅ Stored {len(new_docs)} new chunks")
     return len(new_docs)
 
 
 def search_similar(query: str, n_results: int = 5) -> dict:
-    """
-    Finds the most relevant chunks for a query using similarity search.
-    Returns results in the same format as before so rag.py 
-    doesn't need changes.
-    """
+    """Finds the most relevant chunks for a query."""
 
-    # Check if the collection has anything in it
-    count = vectorstore._collection.count()
+    vs = _get_vectorstore()
+    count = vs._collection.count()
+
     if count == 0:
         return {"documents": [[]], "metadatas": [[]]}
 
-    # Don't ask for more results than we have stored
-    actual_results = min(n_results, count)
-
-    # LangChain similarity search — returns list of Document objects
-    results = vectorstore.similarity_search(query, k=actual_results)
-
-    # Convert back to the same dict format that rag.py expects
-    documents = [doc.page_content for doc in results]
-    metadatas = [doc.metadata for doc in results]
+    results = vs.similarity_search(query, k=min(n_results, count))
 
     return {
-        "documents": [documents],
-        "metadatas": [metadatas]
+        "documents": [[doc.page_content for doc in results]],
+        "metadatas": [[doc.metadata for doc in results]]
     }
 
 
 def list_documents() -> List[str]:
-    """Returns all unique PDF filenames stored in the database."""
+    """Returns all unique PDF filenames in the database."""
 
-    count = vectorstore._collection.count()
-    if count == 0:
+    vs = _get_vectorstore()
+
+    if vs._collection.count() == 0:
         return []
 
-    # Get all stored items and extract unique source filenames
-    all_items = vectorstore.get()
-
-    filenames = set()
-    for metadata in all_items["metadatas"]:
-        if metadata and "source" in metadata:
-            filenames.add(metadata["source"])
-
+    all_items = vs.get()
+    filenames = {m["source"] for m in all_items["metadatas"] 
+                 if m and "source" in m}
     return sorted(list(filenames))
