@@ -27,7 +27,7 @@ def _get_embeddings() -> OpenAIEmbeddings:
             raise ValueError("OPENAI_API_KEY environment variable is not set!")
         _embeddings_model = OpenAIEmbeddings(
             openai_api_key=api_key,
-            model="text-embedding-ada-002"
+            model="text-embedding-3-small"
         )
     return _embeddings_model
 
