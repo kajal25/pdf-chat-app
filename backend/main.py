@@ -8,7 +8,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers import upload, chat
-import os
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -29,12 +28,10 @@ app = FastAPI(
 # In development, we allow all origins.
 # In production, you should set this to your actual frontend URL.
 
-print("FRONTEND_URL =", os.getenv("FRONTEND_URL"))
-
 allowed_origins = [
     "http://localhost:5173",          # Local React dev server (Vite)
     "http://localhost:3000",          # Alternative React port
-    os.getenv("FRONTEND_URL", ""),    # Production frontend URL from env
+    "https://pdf-chat-app-xi.vercel.app",    # Production frontend URL from env
 ]
 
 app.add_middleware(
