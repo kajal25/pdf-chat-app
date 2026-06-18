@@ -29,6 +29,8 @@ app = FastAPI(
 # In development, we allow all origins.
 # In production, you should set this to your actual frontend URL.
 
+print("FRONTEND_URL =", os.getenv("FRONTEND_URL"))
+
 allowed_origins = [
     "http://localhost:5173",          # Local React dev server (Vite)
     "http://localhost:3000",          # Alternative React port
